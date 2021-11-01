@@ -139,12 +139,13 @@ ros::Publisher pubLaserCloudSurround, pubLaserCloudMap, pubLaserCloudFullRes, pu
 nav_msgs::Path laserAfterMappedPath;
 
 // set initial guess
+// 提供优化使用的初值，纯lidar条件下最好初值
 void transformAssociateToMap()
 {
 	q_w_curr = q_wmap_wodom * q_wodom_curr;
 	t_w_curr = q_wmap_wodom * t_wodom_curr + t_wmap_wodom;
 }
-
+//更新odom到map之间的位姿
 void transformUpdate()
 {
 	q_wmap_wodom = q_w_curr * q_wodom_curr.inverse();
@@ -174,7 +175,7 @@ void pointAssociateTobeMapped(PointType const *const pi, PointType *const po)
 
 void laserCloudCornerLastHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudCornerLast2)
 {
-	mBuf.lock();
+	mBuf.lock();//线程锁，保证和主线程处理队列这两个队列不会同时处理同一个队列
 	cornerLastBuf.push(laserCloudCornerLast2);
 	mBuf.unlock();
 }
@@ -214,6 +215,7 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
 	Eigen::Quaterniond q_w_curr = q_wmap_wodom * q_wodom_curr;
 	Eigen::Vector3d t_w_curr = q_wmap_wodom * t_wodom_curr + t_wmap_wodom; 
 
+	//转到map坐标系后再发布出去
 	nav_msgs::Odometry odomAftMapped;
 	odomAftMapped.header.frame_id = "/camera_init";
 	odomAftMapped.child_frame_id = "/aft_mapped";
@@ -232,12 +234,14 @@ void process()
 {
 	while(1)
 	{
+		//首先把线、面点取出
 		while (!cornerLastBuf.empty() && !surfLastBuf.empty() &&
 			!fullResBuf.empty() && !odometryBuf.empty())
 		{
 			mBuf.lock();
+			// 以cornerlast为时间基准，保证实时性
 			while (!odometryBuf.empty() && odometryBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
-				odometryBuf.pop();
+				odometryBuf.pop();//进行时间同步
 			if (odometryBuf.empty())
 			{
 				mBuf.unlock();
@@ -260,6 +264,7 @@ void process()
 				break;
 			}
 
+			//确保时间一致
 			timeLaserCloudCornerLast = cornerLastBuf.front()->header.stamp.toSec();
 			timeLaserCloudSurfLast = surfLastBuf.front()->header.stamp.toSec();
 			timeLaserCloudFullRes = fullResBuf.front()->header.stamp.toSec();
@@ -275,6 +280,7 @@ void process()
 				break;
 			}
 
+			//ros->pcl格式
 			laserCloudCornerLast->clear();
 			pcl::fromROSMsg(*cornerLastBuf.front(), *laserCloudCornerLast);
 			cornerLastBuf.pop();
@@ -287,6 +293,7 @@ void process()
 			pcl::fromROSMsg(*fullResBuf.front(), *laserCloudFullRes);
 			fullResBuf.pop();
 
+			// odom消息转换为eigen
 			q_wodom_curr.x() = odometryBuf.front()->pose.pose.orientation.x;
 			q_wodom_curr.y() = odometryBuf.front()->pose.pose.orientation.y;
 			q_wodom_curr.z() = odometryBuf.front()->pose.pose.orientation.z;
@@ -309,10 +316,13 @@ void process()
 			transformAssociateToMap();
 
 			TicToc t_shift;
-			int centerCubeI = int((t_w_curr.x() + 25.0) / 50.0) + laserCloudCenWidth;
+			// 构建栅格地图，根据初始状态值计算寻找当前位姿在地图中的索引，每个栅格边长50m
+			// 其实是个以当前帧为中心构建的局部地图，全局地图太费内存
+			int centerCubeI = int((t_w_curr.x() + 25.0) / 50.0) + laserCloudCenWidth;//索引+偏移值，确保四舍五入+25.0/50
 			int centerCubeJ = int((t_w_curr.y() + 25.0) / 50.0) + laserCloudCenHeight;
 			int centerCubeK = int((t_w_curr.z() + 25.0) / 50.0) + laserCloudCenDepth;
 
+			// 和c语言中取整有关，向0取整，如果是负数就-1
 			if (t_w_curr.x() + 25.0 < 0)
 				centerCubeI--;
 			if (t_w_curr.y() + 25.0 < 0)
@@ -320,37 +330,44 @@ void process()
 			if (t_w_curr.z() + 25.0 < 0)
 				centerCubeK--;
 
+			// 快到地图边界的时候，对栅格地图进行调整
 			while (centerCubeI < 3)
 			{
 				for (int j = 0; j < laserCloudHeight; j++)
 				{
 					for (int k = 0; k < laserCloudDepth; k++)
 					{ 
+						//从最右边开始挪
 						int i = laserCloudWidth - 1;
 						pcl::PointCloud<PointType>::Ptr laserCloudCubeCornerPointer =
-							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k]; 
+							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k]; //一维数组表示三维存放空间
 						pcl::PointCloud<PointType>::Ptr laserCloudCubeSurfPointer =
 							laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
 						for (; i >= 1; i--)
 						{
+							//开始移动，i-1 j k的点云挪到 i j k，挪指针比较方便，整体右移动
 							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 								laserCloudCornerArray[i - 1 + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
 							laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 								laserCloudSurfArray[i - 1 + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
 						}
+						//此时的i=0,也就是最左边的格子赋值了之前右边的格子
 						laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 							laserCloudCubeCornerPointer;
 						laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 							laserCloudCubeSurfPointer;
+						//当前点云清空，对指针的操作，相当于左边的格子清空
 						laserCloudCubeCornerPointer->clear();
 						laserCloudCubeSurfPointer->clear();
 					}
 				}
 
+				//索引右移
 				centerCubeI++;
 				laserCloudCenWidth++;
 			}
 
+			//靠近右边界，往左移
 			while (centerCubeI >= laserCloudWidth - 3)
 			{ 
 				for (int j = 0; j < laserCloudHeight; j++)
@@ -362,7 +379,7 @@ void process()
 							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
 						pcl::PointCloud<PointType>::Ptr laserCloudCubeSurfPointer =
 							laserCloudSurfArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
-						for (; i < laserCloudWidth - 1; i++)
+						for (; i < laserCloudWidth - 1; i++)//和上边的不同
 						{
 							laserCloudCornerArray[i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k] =
 								laserCloudCornerArray[i + 1 + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k];
@@ -378,6 +395,7 @@ void process()
 					}
 				}
 
+				//索引自减
 				centerCubeI--;
 				laserCloudCenWidth--;
 			}
@@ -506,9 +524,11 @@ void process()
 				laserCloudCenDepth--;
 			}
 
+			//上面的内容就把xyz三个方向靠近边界的情况进行了调整，维护当前的局部地图
 			int laserCloudValidNum = 0;
 			int laserCloudSurroundNum = 0;
 
+			// 以当前格子为中心，选取周围的点进行scan_to_map, 5 个格子
 			for (int i = centerCubeI - 2; i <= centerCubeI + 2; i++)
 			{
 				for (int j = centerCubeJ - 2; j <= centerCubeJ + 2; j++)
@@ -519,6 +539,7 @@ void process()
 							j >= 0 && j < laserCloudHeight &&
 							k >= 0 && k < laserCloudDepth)
 						{ 
+							//局部地图的索引
 							laserCloudValidInd[laserCloudValidNum] = i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k;
 							laserCloudValidNum++;
 							laserCloudSurroundInd[laserCloudSurroundNum] = i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k;
@@ -528,17 +549,19 @@ void process()
 				}
 			}
 
+			// 构建真正局部地图
 			laserCloudCornerFromMap->clear();
 			laserCloudSurfFromMap->clear();
 			for (int i = 0; i < laserCloudValidNum; i++)
 			{
-				*laserCloudCornerFromMap += *laserCloudCornerArray[laserCloudValidInd[i]];
-				*laserCloudSurfFromMap += *laserCloudSurfArray[laserCloudValidInd[i]];
+				*laserCloudCornerFromMap += *laserCloudCornerArray[laserCloudValidInd[i]];//线地图
+				*laserCloudSurfFromMap += *laserCloudSurfArray[laserCloudValidInd[i]];//面地图
 			}
 			int laserCloudCornerFromMapNum = laserCloudCornerFromMap->points.size();
 			int laserCloudSurfFromMapNum = laserCloudSurfFromMap->points.size();
 
 
+			//当前帧下采样，减少数据量
 			pcl::PointCloud<PointType>::Ptr laserCloudCornerStack(new pcl::PointCloud<PointType>());
 			downSizeFilterCorner.setInputCloud(laserCloudCornerLast);
 			downSizeFilterCorner.filter(*laserCloudCornerStack);
@@ -551,36 +574,44 @@ void process()
 
 			printf("map prepare time %f ms\n", t_shift.toc());
 			printf("map corner num %d  surf num %d \n", laserCloudCornerFromMapNum, laserCloudSurfFromMapNum);
+			//地图点数不能太少
+			// 建立当前帧与地图的约束
 			if (laserCloudCornerFromMapNum > 10 && laserCloudSurfFromMapNum > 50)
 			{
 				TicToc t_opt;
 				TicToc t_tree;
+				// 分别存地图的线和面特征
 				kdtreeCornerFromMap->setInputCloud(laserCloudCornerFromMap);
 				kdtreeSurfFromMap->setInputCloud(laserCloudSurfFromMap);
 				printf("build tree time %f ms \n", t_tree.toc());
 
 				for (int iterCount = 0; iterCount < 2; iterCount++)
 				{
-					//ceres::LossFunction *loss_function = NULL;
+					//ceres::LossFunction *loss_function = NULL;					
 					ceres::LossFunction *loss_function = new ceres::HuberLoss(0.1);
+					//和前端的优化问题构建类似，旋转四元数不能直接加
 					ceres::LocalParameterization *q_parameterization =
 						new ceres::EigenQuaternionParameterization();
 					ceres::Problem::Options problem_options;
 
 					ceres::Problem problem(problem_options);
 					problem.AddParameterBlock(parameters, 4, q_parameterization);
-					problem.AddParameterBlock(parameters + 4, 3);
+					problem.AddParameterBlock(parameters + 4, 3);//后三维是位移
 
 					TicToc t_data;
 					int corner_num = 0;
 
+					//构建当前帧和地图的线、面约束
 					for (int i = 0; i < laserCloudCornerStackNum; i++)
 					{
 						pointOri = laserCloudCornerStack->points[i];
 						//double sqrtDis = pointOri.x * pointOri.x + pointOri.y * pointOri.y + pointOri.z * pointOri.z;
-						pointAssociateToMap(&pointOri, &pointSel);
+						pointAssociateToMap(&pointOri, &pointSel);//当前点投影到地图坐标系下
+						//在地图中寻找最近的5个边缘特征
 						kdtreeCornerFromMap->nearestKSearch(pointSel, 5, pointSearchInd, pointSearchSqDis); 
 
+						//从小到大排，判断最远的点距离小于1m，否则认为是无效的
+						//同一条直线上的5个点，其最大特征值所对应的特征向量是其直线方向
 						if (pointSearchSqDis[4] < 1.0)
 						{ 
 							std::vector<Eigen::Vector3d> nearCorners;
@@ -593,30 +624,36 @@ void process()
 								center = center + tmp;
 								nearCorners.push_back(tmp);
 							}
-							center = center / 5.0;
+							center = center / 5.0;//5个点的均值
 
+							//构建协方差矩阵
 							Eigen::Matrix3d covMat = Eigen::Matrix3d::Zero();
 							for (int j = 0; j < 5; j++)
 							{
-								Eigen::Matrix<double, 3, 1> tmpZeroMean = nearCorners[j] - center;
+								Eigen::Matrix<double, 3, 1> tmpZeroMean = nearCorners[j] - center;//减去均值，归一化
 								covMat = covMat + tmpZeroMean * tmpZeroMean.transpose();
 							}
 
+							// 特征值分解
 							Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(covMat);
 
 							// if is indeed line feature
 							// note Eigen library sort eigenvalues in increasing order
-							Eigen::Vector3d unit_direction = saes.eigenvectors().col(2);
+							// Eigen中特征值是递增排序，，根绝特征值分解情况判断是否是真线特征，特征向量就是线特征的方向
+							Eigen::Vector3d unit_direction = saes.eigenvectors().col(2);//最后这个特征向量是最大特征值对应的
 							Eigen::Vector3d curr_point(pointOri.x, pointOri.y, pointOri.z);
+							// 检查最大特征值是否大于最小特征值的3倍，作为线特征判断依据
 							if (saes.eigenvalues()[2] > 3 * saes.eigenvalues()[1])
 							{ 
 								Eigen::Vector3d point_on_line = center;
 								Eigen::Vector3d point_a, point_b;
+								//根据你和出来的线特征方向，以中心店为中心构建两个点
 								point_a = 0.1 * unit_direction + point_on_line;
 								point_b = -0.1 * unit_direction + point_on_line;
 
-								ceres::CostFunction *cost_function = LidarEdgeFactor::Create(curr_point, point_a, point_b, 1.0);
-								problem.AddResidualBlock(cost_function, loss_function, parameters, parameters + 4);
+								//构建ceres优化问题，和里程计一样的
+								ceres::CostFunction *cost_function = LidarEdgeFactor::Create(curr_point, point_a, point_b, 1.0);//自动求导
+								problem.AddResidualBlock(cost_function, loss_function, parameters, parameters + 4);//添加残差快
 								corner_num++;	
 							}							
 						}
@@ -640,15 +677,17 @@ void process()
 					}
 
 					int surf_num = 0;
+					//面特征问题构建
 					for (int i = 0; i < laserCloudSurfStackNum; i++)
 					{
 						pointOri = laserCloudSurfStack->points[i];
 						//double sqrtDis = pointOri.x * pointOri.x + pointOri.y * pointOri.y + pointOri.z * pointOri.z;
-						pointAssociateToMap(&pointOri, &pointSel);
+						pointAssociateToMap(&pointOri, &pointSel);//首先当前点投影到地图坐标系，然后寻找最近的5个点
 						kdtreeSurfFromMap->nearestKSearch(pointSel, 5, pointSearchInd, pointSearchSqDis);
 
-						Eigen::Matrix<double, 5, 3> matA0;
-						Eigen::Matrix<double, 5, 1> matB0 = -1 * Eigen::Matrix<double, 5, 1>::Ones();
+						//Ax + By + Cz + 1 = 0==> Ax + By + Cz = -1
+						Eigen::Matrix<double, 5, 3> matA0;//构建5*3的矩阵进行求解
+						Eigen::Matrix<double, 5, 1> matB0 = -1 * Eigen::Matrix<double, 5, 1>::Ones();//参考上面
 						if (pointSearchSqDis[4] < 1.0)
 						{
 							
@@ -660,15 +699,17 @@ void process()
 								//printf(" pts %f %f %f ", matA0(j, 0), matA0(j, 1), matA0(j, 2));
 							}
 							// find the norm of plane
+							// EIGEN求解矩阵的解， ABC的值就是平面的法向量
 							Eigen::Vector3d norm = matA0.colPivHouseholderQr().solve(matB0);
 							double negative_OA_dot_norm = 1 / norm.norm();
-							norm.normalize();
+							norm.normalize();//归一化，后面计算点到面的距离时，分母是1
 
 							// Here n(pa, pb, pc) is unit norm of plane
 							bool planeValid = true;
 							for (int j = 0; j < 5; j++)
 							{
 								// if OX * n > 0.2, then plane is not fit well
+								// 计算这几个点到面的距离，如果距离过大认为是无效的
 								if (fabs(norm(0) * laserCloudSurfFromMap->points[pointSearchInd[j]].x +
 										 norm(1) * laserCloudSurfFromMap->points[pointSearchInd[j]].y +
 										 norm(2) * laserCloudSurfFromMap->points[pointSearchInd[j]].z + negative_OA_dot_norm) > 0.2)
@@ -680,6 +721,7 @@ void process()
 							Eigen::Vector3d curr_point(pointOri.x, pointOri.y, pointOri.z);
 							if (planeValid)
 							{
+								//构建约束，与前端略有不同
 								ceres::CostFunction *cost_function = LidarPlaneNormFactor::Create(curr_point, norm, negative_OA_dot_norm);
 								problem.AddResidualBlock(cost_function, loss_function, parameters, parameters + 4);
 								surf_num++;
@@ -711,7 +753,7 @@ void process()
 
 					TicToc t_solver;
 					ceres::Solver::Options options;
-					options.linear_solver_type = ceres::DENSE_QR;
+					options.linear_solver_type = ceres::DENSE_QR;//稠密QR分解求解
 					options.max_num_iterations = 4;
 					options.minimizer_progress_to_stdout = false;
 					options.check_gradients = false;
@@ -731,17 +773,22 @@ void process()
 			{
 				ROS_WARN("time Map corner and surf num are not enough");
 			}
+			//更新odom到map之间的位姿
 			transformUpdate();
 
 			TicToc t_add;
+			// 地图更新，先便利地图的角点
 			for (int i = 0; i < laserCloudCornerStackNum; i++)
 			{
+				//投影到地图坐标系
 				pointAssociateToMap(&laserCloudCornerStack->points[i], &pointSel);
 
+				//计算出这个点所在的格子
 				int cubeI = int((pointSel.x + 25.0) / 50.0) + laserCloudCenWidth;
 				int cubeJ = int((pointSel.y + 25.0) / 50.0) + laserCloudCenHeight;
 				int cubeK = int((pointSel.z + 25.0) / 50.0) + laserCloudCenDepth;
 
+				//如果是负数，和前面边界的检测时候做一样的操作
 				if (pointSel.x + 25.0 < 0)
 					cubeI--;
 				if (pointSel.y + 25.0 < 0)
@@ -749,15 +796,17 @@ void process()
 				if (pointSel.z + 25.0 < 0)
 					cubeK--;
 
+				//在范围之内
 				if (cubeI >= 0 && cubeI < laserCloudWidth &&
 					cubeJ >= 0 && cubeJ < laserCloudHeight &&
 					cubeK >= 0 && cubeK < laserCloudDepth)
 				{
-					int cubeInd = cubeI + laserCloudWidth * cubeJ + laserCloudWidth * laserCloudHeight * cubeK;
-					laserCloudCornerArray[cubeInd]->push_back(pointSel);
+					int cubeInd = cubeI + laserCloudWidth * cubeJ + laserCloudWidth * laserCloudHeight * cubeK;//计算索引
+					laserCloudCornerArray[cubeInd]->push_back(pointSel);//把点云放到局部地图
 				}
 			}
 
+			//面点的操作是一样的
 			for (int i = 0; i < laserCloudSurfStackNum; i++)
 			{
 				pointAssociateToMap(&laserCloudSurfStack->points[i], &pointSel);
@@ -785,6 +834,7 @@ void process()
 
 			
 			TicToc t_filter;
+			// 把角点和面点进行下采样，局部地图，也是前面的前后左右各两个格子，上下个一个
 			for (int i = 0; i < laserCloudValidNum; i++)
 			{
 				int ind = laserCloudValidInd[i];
@@ -803,11 +853,13 @@ void process()
 			
 			TicToc t_pub;
 			//publish surround map for every 5 frame
+			// 每隔5帧进行发布
 			if (frameCount % 5 == 0)
 			{
 				laserCloudSurround->clear();
 				for (int i = 0; i < laserCloudSurroundNum; i++)
 				{
+					//这里就不区分线和面点，加在一起进行发布
 					int ind = laserCloudSurroundInd[i];
 					*laserCloudSurround += *laserCloudCornerArray[ind];
 					*laserCloudSurround += *laserCloudSurfArray[ind];
@@ -820,9 +872,11 @@ void process()
 				pubLaserCloudSurround.publish(laserCloudSurround3);
 			}
 
+			//每隔20帧发布全量的局部地图
 			if (frameCount % 20 == 0)
 			{
 				pcl::PointCloud<PointType> laserCloudMap;
+				// 21 * 21 * 11 = 4851
 				for (int i = 0; i < 4851; i++)
 				{
 					laserCloudMap += *laserCloudCornerArray[i];
@@ -841,6 +895,7 @@ void process()
 				pointAssociateToMap(&laserCloudFullRes->points[i], &laserCloudFullRes->points[i]);
 			}
 
+			//这里再次发布当前帧
 			sensor_msgs::PointCloud2 laserCloudFullRes3;
 			pcl::toROSMsg(*laserCloudFullRes, laserCloudFullRes3);
 			laserCloudFullRes3.header.stamp = ros::Time().fromSec(timeLaserOdometry);
@@ -851,6 +906,7 @@ void process()
 
 			printf("whole mapping time %f ms +++++\n", t_whole.toc());
 
+			//发布当前帧相对世界坐标系的位姿，就是相对与地图的
 			nav_msgs::Odometry odomAftMapped;
 			odomAftMapped.header.frame_id = "/camera_init";
 			odomAftMapped.child_frame_id = "/aft_mapped";
@@ -864,6 +920,7 @@ void process()
 			odomAftMapped.pose.pose.position.z = t_w_curr.z();
 			pubOdomAftMapped.publish(odomAftMapped);
 
+			//发布当前轨迹
 			geometry_msgs::PoseStamped laserAfterMappedPose;
 			laserAfterMappedPose.header = odomAftMapped.header;
 			laserAfterMappedPose.pose = odomAftMapped.pose.pose;
@@ -872,6 +929,7 @@ void process()
 			laserAfterMappedPath.poses.push_back(laserAfterMappedPose);
 			pubLaserAfterMappedPath.publish(laserAfterMappedPath);
 
+			//发布tf
 			static tf::TransformBroadcaster br;
 			tf::Transform transform;
 			tf::Quaternion q;
@@ -887,11 +945,13 @@ void process()
 
 			frameCount++;
 		}
-		std::chrono::milliseconds dura(2);
-        std::this_thread::sleep_for(dura);
+		std::chrono::milliseconds dura(2);//休息2ms
+        std::this_thread::sleep_for(dura);//做一个sleep，避免一直占用cpu
 	}
 }
 
+
+//通过提供cur到odom的初始解，进行优化，得到cur到map，最后得到map到odom的位姿变换
 int main(int argc, char **argv)
 {
 	ros::init(argc, argv, "laserMapping");
@@ -899,12 +959,13 @@ int main(int argc, char **argv)
 
 	float lineRes = 0;
 	float planeRes = 0;
-	nh.param<float>("mapping_line_resolution", lineRes, 0.4);
+	nh.param<float>("mapping_line_resolution", lineRes, 0.4);//线、面特征点云的分辨率
 	nh.param<float>("mapping_plane_resolution", planeRes, 0.8);
 	printf("line resolution %f plane resolution %f \n", lineRes, planeRes);
-	downSizeFilterCorner.setLeafSize(lineRes, lineRes,lineRes);
+	downSizeFilterCorner.setLeafSize(lineRes, lineRes,lineRes);//进行下采样，体素滤波
 	downSizeFilterSurf.setLeafSize(planeRes, planeRes, planeRes);
 
+	//订阅前端发布的消息
 	ros::Subscriber subLaserCloudCornerLast = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 100, laserCloudCornerLastHandler);
 
 	ros::Subscriber subLaserCloudSurfLast = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_surf_last", 100, laserCloudSurfLastHandler);
@@ -927,7 +988,7 @@ int main(int argc, char **argv)
 
 	for (int i = 0; i < laserCloudNum; i++)
 	{
-		laserCloudCornerArray[i].reset(new pcl::PointCloud<PointType>());
+		laserCloudCornerArray[i].reset(new pcl::PointCloud<PointType>());//存储后端地图用，new了一个地址，
 		laserCloudSurfArray[i].reset(new pcl::PointCloud<PointType>());
 	}
 
